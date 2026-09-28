@@ -1,6 +1,6 @@
 {
   "module": "github.com/ecko-lang/checkpoint",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "entrypoint": "main.ecko",
   "description": "Resumable long-running jobs over std.sql: batch a source through a handler with the cursor committed in the same transaction as the writes, and memoise named pipeline steps. A crashed job resumes where it stopped and applies nothing twice.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
