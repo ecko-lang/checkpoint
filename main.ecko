@@ -1,0 +1,346 @@
+# checkpoint - resumable long-running jobs over std.sql.
+#
+# A job that dies at record 800,000,000 should start again at 800,000,000, and
+# apply nothing twice. Two primitives cover the two shapes of long-running work:
+#
+#   import std.sql
+#   import checkpoint
+#
+#   db = sql.open("ledger.db")
+#   src = checkpoint.sql_source(db, "gen1_transactions", "id")
+#
+#   checkpoint.each_batch(db, "gen2-backfill", src, 10000, fn(batch, tx) {
+#       for row in batch {
+#           sql.exec(tx, "insert into gen2_transactions (id, cents) values (?, ?)", [row.id, row.cents])
+#       }
+#   })
+#
+#   report = checkpoint.step(db, "nightly/extract", fn() extract())
+#
+# The cursor advances in the same sql.transaction as the handler's writes, so
+# a crash replays at most the batch in flight, and that batch's writes rolled
+# back with it. Exactly-once for writes to the same database; at-least-once
+# for anything outside it.
+#
+# State lives in a `checkpoints` table in the caller's database, created on
+# first use. The caller owns the connection: this package never opens, closes
+# or configures one, so it needs no capabilities of its own.
+
+import std.sql
+import std.json
+import std.time
+import std.re
+
+let TABLE_DDL = "create table if not exists checkpoints (name text primary key, kind text not null, cursor text, value text, done integer not null default 0, batches integer not null default 0, items integer not null default 0, started_at integer not null, updated_at integer not null, finished_at integer)"
+
+fn ensure(db) {
+    sql.exec(db, TABLE_DDL)
+    null
+}
+
+fn check_name(fname, name) {
+    unless type_of(name) == "string" and len(name) > 0 {
+        error("checkpoint.{fname}: the job name must be a non-empty string, got {type_of(name)}")
+    }
+    null
+}
+
+fn check_fn(fname, what, f) {
+    unless type_of(f) == "function" {
+        error("checkpoint.{fname}: {what} must be a function, got {type_of(f)}")
+    }
+    null
+}
+
+fn load_row(db, name) = sql.query_one(db, "select * from checkpoints where name = ?", [name])
+
+fn check_kind(fname, row, want) {
+    if row != null and row.kind != want {
+        error(
+            "checkpoint.{fname}: `{row.name}` is already used by a {row.kind}, not a {want}; give each job and step its own name",
+        )
+    }
+    null
+}
+
+# A value may be stored only if JSON gives it back unchanged. Decimals, bytes,
+# secrets, records and functions all encode to something that decodes as a
+# different value, and a resumed run that silently got a different value back
+# is worse than a refusal now.
+fn storable(v) {
+    try { json.decode(json.encode(v)) == v } catch (e) { false }
+}
+
+fn to_status(row) = {
+    name: row.name,
+    kind: row.kind,
+    done: row.done == 1,
+    cursor: if row.cursor == null { null } else { json.decode(row.cursor) },
+    value: if row.value == null { null } else { json.decode(row.value) },
+    batches: row.batches,
+    items: row.items,
+    started_at: row.started_at,
+    updated_at: row.updated_at,
+    finished_at: row.finished_at,
+}
+
+# Call the source and check the shape it returned before anything is written.
+fn pull(source, cursor, limit) {
+    got = source(cursor, limit)
+    unless is_map(got) and is_list(get(got, "items")) {
+        error(
+            "checkpoint.each_batch: the source must return \{ items: [...], next: cursor }, got {type_of(got)}",
+        )
+    }
+    items = got.items
+    next = get(got, "next")
+    if len(items) > 0 and next != null and next == cursor {
+        error(
+            "checkpoint.each_batch: the source returned a batch but did not advance its cursor ({cursor}); it would loop forever",
+        )
+    }
+    unless storable(next) {
+        error(
+            "checkpoint.each_batch: the source's next cursor must survive a JSON round trip (an int, string, list or map), got {type_of(next)}",
+        )
+    }
+    { items: items, next: next }
+}
+
+# One batch, inside one transaction: read the committed cursor, pull, run the
+# handler, advance. `batches` doubles as a version number, so a second run of
+# the same job that raced this one fails its update instead of double-applying.
+fn run_batch(tx, name, source, limit, handler) {
+    row = load_row(tx, name)
+    if row.done == 1 {
+        { n: 0, done: true }
+    } else {
+        cursor = if row.cursor == null { null } else { json.decode(row.cursor) }
+        got = pull(source, cursor, limit)
+        n = len(got.items)
+        now = time.now()
+        if n == 0 {
+            sql.exec(
+                tx,
+                "update checkpoints set done = 1, updated_at = ?, finished_at = ? where name = ?",
+                [now, now, name],
+            )
+            { n: 0, done: true }
+        } else {
+            handler(got.items, tx)
+            last_batch = got.next == null
+            stored = if last_batch { row.cursor } else { json.encode(got.next) }
+            done = if last_batch { 1 } else { 0 }
+            finished = if last_batch { now } else { null }
+            changed = sql.exec(
+                tx,
+                "update checkpoints set cursor = ?, batches = batches + 1, items = items + ?, done = ?, updated_at = ?, finished_at = ? where name = ? and batches = ?",
+                [stored, n, done, now, finished, name, row.batches],
+            )
+            if changed != 1 {
+                error(
+                    "checkpoint.each_batch: `{name}` was advanced by another run while this batch was in flight; run one worker per job",
+                )
+            }
+            { n: n, done: last_batch }
+        }
+    }
+}
+
+## each_batch(db, name, source, limit, handler) -> { batches, items, done, cursor }.
+## Runs the job `name` to completion, one batch per transaction, resuming from
+## the last committed cursor. Each round calls `source(cursor, limit)`, which
+## must return `{ items: [...], next: cursor }` (the cursor is `null` on the
+## first call), then `handler(items, tx)`, then stores `next` - the handler's
+## writes and the new cursor commit together or not at all. If the handler
+## throws, that batch rolls back, the error re-raises, and the next call
+## resumes at the same batch. The run ends when the source returns no items,
+## or returns items with `next: null` (a last page); the job is then marked
+## done and later calls return at once without calling the source. `batches`
+## and `items` count this call's work only; `status` has the totals. Write
+## through `tx` (the same handle as `db`) and do not open another transaction
+## on it inside the handler.
+export fn each_batch(db, name, source, limit, handler) {
+    check_name("each_batch", name)
+    check_fn("each_batch", "the source", source)
+    check_fn("each_batch", "the handler", handler)
+    unless type_of(limit) == "int" and limit > 0 {
+        error("checkpoint.each_batch: limit must be a positive int, got {limit}")
+    }
+    ensure(db)
+    existing = load_row(db, name)
+    check_kind("each_batch", existing, "batch")
+    if existing == null {
+        now = time.now()
+        sql.exec(
+            db,
+            "insert into checkpoints (name, kind, started_at, updated_at) values (?, 'batch', ?, ?) on conflict(name) do nothing",
+            [name, now, now],
+        )
+    }
+    mut batches = 0
+    mut items = 0
+    mut done = false
+    while not done {
+        r = sql.transaction(db, fn(tx) run_batch(tx, name, source, limit, handler))
+        if r.n > 0 {
+            batches = batches + 1
+            items = items + r.n
+        }
+        done = r.done
+    }
+    st = to_status(load_row(db, name))
+    { batches: batches, items: items, done: true, cursor: st.cursor }
+}
+
+## step(db, name, f) -> the value `f()` returned. Runs one named step of a
+## pipeline once. The first successful run stores the result and later calls
+## return the stored value without calling `f`. `f` runs inside a transaction
+## on `db` together with the write that records it, so writes `f` makes
+## through `db` commit only if the step is recorded; if `f` throws, nothing is
+## stored, its writes roll back and the error re-raises. The result must
+## survive a JSON round trip unchanged (null, bool, int, float, string, and
+## lists and maps of those); anything else is refused. Both calls return the
+## decoded form, so the first run and a resumed run see the same value. `f`
+## must not open its own transaction on `db`.
+export fn step(db, name, f) {
+    check_name("step", name)
+    check_fn("step", "the step", f)
+    ensure(db)
+    row = load_row(db, name)
+    check_kind("step", row, "step")
+    if row != null {
+        json.decode(row.value)
+    } else {
+        sql.transaction(
+            db,
+            fn(tx) {
+                v = f()
+                unless storable(v) {
+                    error(
+                        "checkpoint.step: `{name}` returned a {type_of(v)} that does not survive a JSON round trip, so it cannot be stored; return plain data (convert decimals to strings, records to maps)",
+                    )
+                }
+                text = json.encode(v)
+                now = time.now()
+                sql.exec(
+                    tx,
+                    "insert into checkpoints (name, kind, value, done, started_at, updated_at, finished_at) values (?, 'step', ?, 1, ?, ?, ?)",
+                    [name, text, now, now, now],
+                )
+                json.decode(text)
+            },
+        )
+    }
+}
+
+## status(db, name) -> map or null. The stored state of a job or step, or
+## `null` if `name` has never run (or was reset). Fields: `name`, `kind`
+## (`"batch"` or `"step"`), `done`, `cursor` (the last committed cursor of a
+## batch job), `value` (a step's stored result), `batches` and `items` (totals
+## across every run), and `started_at`, `updated_at`, `finished_at` in
+## milliseconds since the Unix epoch.
+export fn status(db, name) {
+    check_name("status", name)
+    ensure(db)
+    row = load_row(db, name)
+    if row == null { null } else { to_status(row) }
+}
+
+## reset(db, name) -> Bool. Forgets a job or step, so the next `each_batch`
+## starts from the beginning and the next `step` runs its function again.
+## Returns whether there was anything to forget. It does not undo the writes
+## the job made; clear those yourself first if a rerun would duplicate them.
+export fn reset(db, name) {
+    check_name("reset", name)
+    ensure(db)
+    sql.exec(db, "delete from checkpoints where name = ?", [name]) > 0
+}
+
+# --- the SQL keyset source ----------------------------------------------------
+
+fn check_ident(what, s) {
+    unless type_of(s) == "string" and re.test(r"^[A-Za-z_][A-Za-z0-9_]*$", s) {
+        error(
+            "checkpoint.sql_source: {what} must be a plain SQL identifier (letters, digits, underscore), got {s}",
+        )
+    }
+    null
+}
+
+fn quote(ident) = "\"" + ident + "\""
+
+# True when `key` alone identifies a row: the single-column primary key, or
+# the only column of a full (non-partial) unique index.
+fn key_is_unique(db, table, key) {
+    pk = sql.query(db, "select name from pragma_table_info(?) where pk > 0", [table])
+    if len(pk) == 1 and pk[0].name == key { true } else {
+        indexes = sql.query(
+            db,
+            "select name from pragma_index_list(?) where \"unique\" = 1 and partial = 0",
+            [table],
+        )
+        any(indexes, fn(ix) {
+            cols = sql.query(db, "select name from pragma_index_info(?)", [ix.name])
+            len(cols) == 1 and cols[0].name == key
+        })
+    }
+}
+
+## sql_source(db, table, key, where = null, columns = null) -> source function.
+## A keyset-paginated source over `table` for `each_batch`: each batch is the
+## next `limit` rows with `key > cursor`, ordered by `key`, and the cursor is
+## the last row's key. It never uses OFFSET, so each batch costs the same
+## however far in the job is, and gaps in the key are harmless. `key` must be
+## unique on its own - the table's single-column primary key or the only
+## column of a non-partial unique index - and this is checked when the source
+## is built, because keyset over a non-unique key silently skips rows. Rows
+## whose key is NULL are never visited. `where` narrows the rows with a
+## `sql { ... }` block (its holes bind as parameters); `columns` is a list of
+## column names, and the key is always included. Items are row maps.
+export fn sql_source(db, table, key, where = null, columns = null) {
+    check_ident("the table", table)
+    check_ident("the key", key)
+    cols = sql.query(db, "select name from pragma_table_info(?)", [table])
+    if len(cols) == 0 { error("checkpoint.sql_source: no table named `{table}`") }
+    unless any(cols, fn(c) c.name == key) {
+        error("checkpoint.sql_source: `{table}` has no column `{key}`")
+    }
+    unless key_is_unique(db, table, key) {
+        error(
+            "checkpoint.sql_source: `{key}` is not unique in `{table}`; keyset pagination over a non-unique key skips rows. Use the primary key or add a unique index on it",
+        )
+    }
+    select = if columns == null {
+        "*"
+    } else {
+        unless is_list(columns) {
+            error(
+                "checkpoint.sql_source: columns must be a list of column names, got {type_of(columns)}",
+            )
+        }
+        for c in columns {
+            check_ident("each column", c)
+        }
+        wanted = if any(columns, fn(c) c == key) { columns } else { columns + [key] }
+        join(map(wanted, quote), ", ")
+    }
+    unless where == null or is_map(where) and get(where, "query") != null {
+        error(
+            "checkpoint.sql_source: where must be a sql \{ ... } block, so its values bind as parameters",
+        )
+    }
+    extra = if where == null { "" } else { " and (" + where.query + ")" }
+    extra_params = if where == null { [] } else { where.params }
+    base = "select {select} from {quote(table)} where {quote(key)}"
+    tail = "{extra} order by {quote(key)} limit ?"
+    fn(cursor, limit) {
+        rows = if cursor == null {
+            sql.query(db, base + " is not null" + tail, extra_params + [limit])
+        } else {
+            sql.query(db, base + " > ?" + tail, [cursor] + extra_params + [limit])
+        }
+        next = if len(rows) == 0 { cursor } else { get(last(rows), key) }
+        { items: rows, next: next }
+    }
+}

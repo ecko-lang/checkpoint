@@ -1,0 +1,320 @@
+# Tests for the checkpoint package - offline and deterministic.
+#
+# Every test opens its own :memory: database, except the restart test, which
+# uses a file in a fresh temp directory so it can close the connection and
+# open a new one the way a restarted process would. A "crash" is a handler
+# that throws mid-run: the transaction machinery treats it exactly as it
+# treats a process that dies before COMMIT.
+import std.test
+import std.sql
+import std.fs
+import "../main.ecko" as cp
+
+# A source table `gen1` holding the given ids, each with cents = id * 100.
+fn seeded(ids) {
+    db = sql.open(":memory:")
+    sql.exec(db, "create table gen1 (id integer primary key, cents integer not null)")
+    sql.exec(db, "create table gen2 (id integer, cents integer)")
+    for id in ids {
+        sql.exec(db, "insert into gen1 (id, cents) values (?, ?)", [id, id * 100])
+    }
+    db
+}
+
+# gen2 has no unique constraint on purpose, so a row written twice shows up
+# as a duplicate instead of as a constraint error.
+fn copy_rows(batch, tx) {
+    for row in batch {
+        sql.exec(tx, "insert into gen2 (id, cents) values (?, ?)", [row.id, row.cents])
+    }
+}
+
+fn row_count(db, table) = sql.query_one(db, "select count(*) as n from {table}").n
+
+fn distinct_ids(db) = sql.query_one(db, "select count(distinct id) as n from gen2").n
+
+# A source over a fixed list, paged by index. Records each call in `calls`.
+fn list_source(xs, calls) = fn(cursor, limit) {
+    cell_update(calls, fn(n) n + 1)
+    start = if cursor == null { 0 } else { cursor }
+    stop = if start + limit > len(xs) { len(xs) } else { start + limit }
+    { items: xs[start..stop], next: stop }
+}
+
+# --- each_batch --------------------------------------------------------------
+
+test.case("a full run processes every row exactly once", fn() {
+    db = seeded(1..=25)
+    r = cp.each_batch(db, "backfill", cp.sql_source(db, "gen1", "id"), 10, copy_rows)
+    test.eq(r.batches, 3)
+    test.eq(r.items, 25)
+    test.eq(r.done, true)
+    test.eq(r.cursor, 25)
+    test.eq(row_count(db, "gen2"), 25)
+    test.eq(distinct_ids(db), 25)
+    test.eq(sql.query_one(db, "select sum(cents) as s from gen2").s, 32500)
+    st = cp.status(db, "backfill")
+    test.eq(st.kind, "batch")
+    test.eq(st.done, true)
+    test.eq(st.batches, 3)
+    test.eq(st.items, 25)
+    test.ok(st.finished_at != null, "finished_at is set")
+})
+
+test.case("a handler that throws rolls back its batch and leaves the cursor behind it", fn() {
+    db = seeded(1..=25)
+    src = cp.sql_source(db, "gen1", "id")
+    # Writes the whole third batch (ids 21..25), then fails.
+    crash_on_third = fn(batch, tx) {
+        copy_rows(batch, tx)
+        if batch[0].id == 21 { error({ kind: "crash", message: "killed mid-batch" }) }
+    }
+    test.err(fn() cp.each_batch(db, "backfill", src, 10, crash_on_third), "killed mid-batch")
+    test.eq(row_count(db, "gen2"), 20)
+    st = cp.status(db, "backfill")
+    test.eq(st.cursor, 20)
+    test.eq(st.batches, 2)
+    test.eq(st.done, false)
+
+    r = cp.each_batch(db, "backfill", src, 10, copy_rows)
+    test.eq(r.batches, 1)
+    test.eq(r.items, 5)
+    test.eq(row_count(db, "gen2"), 25)
+    test.eq(distinct_ids(db), 25)
+    test.eq(cp.status(db, "backfill").batches, 3)
+})
+
+test.case("a restart on a new connection resumes where the last one stopped", fn() {
+    path = fs.join(fs.temp_dir(), "restart.db")
+    if fs.exists(path) { fs.remove(path) }
+    first = sql.open(path)
+    sql.exec(first, "create table gen1 (id integer primary key, cents integer not null)")
+    sql.exec(first, "create table gen2 (id integer, cents integer)")
+    for id in 1..=12 {
+        sql.exec(first, "insert into gen1 (id, cents) values (?, ?)", [id, id])
+    }
+    crash = fn(batch, tx) {
+        copy_rows(batch, tx)
+        if batch[0].id == 9 { error("process killed") }
+    }
+    test.err(
+        fn() cp.each_batch(first, "job", cp.sql_source(first, "gen1", "id"), 4, crash),
+        "process killed",
+    )
+    sql.close(first)
+
+    second = sql.open(path)
+    r = cp.each_batch(second, "job", cp.sql_source(second, "gen1", "id"), 4, copy_rows)
+    test.eq(r.batches, 1)
+    test.eq(row_count(second, "gen2"), 12)
+    test.eq(distinct_ids(second), 12)
+    sql.close(second)
+    fs.remove(path)
+})
+
+test.case("a completed job reruns as a no-op without calling the source", fn() {
+    db = seeded(1..=5)
+    calls = cell(0)
+    cp.each_batch(db, "once", list_source([1, 2, 3], calls), 2, fn(batch, tx) null)
+    test.eq(cell_get(calls), 3)
+    r = cp.each_batch(
+        db,
+        "once",
+        list_source([1, 2, 3], calls),
+        2,
+        fn(batch, tx) error("must not run"),
+    )
+    test.eq(r.batches, 0)
+    test.eq(r.items, 0)
+    test.eq(r.done, true)
+    test.eq(cell_get(calls), 3)
+})
+
+test.case("a source returning an empty batch ends the run", fn() {
+    db = sql.open(":memory:")
+    calls = cell(0)
+    r = cp.each_batch(db, "empty", list_source([], calls), 10, fn(batch, tx) error("never called"))
+    test.eq(r.batches, 0)
+    test.eq(r.done, true)
+    test.eq(cell_get(calls), 1)
+    st = cp.status(db, "empty")
+    test.eq(st.done, true)
+    test.eq(st.cursor, null)
+})
+
+test.case("a batch with next: null is the last page", fn() {
+    db = sql.open(":memory:")
+    sql.exec(db, "create table seen (page text)")
+    pages = { start: { items: ["a", "b"], next: "p2" }, p2: { items: ["c"], next: null } }
+    calls = cell(0)
+    src = fn(cursor, limit) {
+        cell_update(calls, fn(n) n + 1)
+        pages[if cursor == null { "start" } else { cursor }]
+    }
+    r = cp.each_batch(db, "api", src, 100, fn(batch, tx) {
+        for x in batch {
+            sql.exec(tx, "insert into seen (page) values (?)", [x])
+        }
+    })
+    test.eq(r.batches, 2)
+    test.eq(r.items, 3)
+    test.eq(cell_get(calls), 2)
+    test.eq(row_count(db, "seen"), 3)
+    test.eq(cp.status(db, "api").cursor, "p2")
+})
+
+test.case("each_batch refuses a source that does not advance or has the wrong shape", fn() {
+    db = sql.open(":memory:")
+    stuck = fn(cursor, limit) ({ items: [1], next: 7 })
+    test.err(fn() cp.each_batch(db, "stuck", stuck, 1, fn(b, tx) null), "did not advance")
+    # The first batch committed (cursor null -> 7); the second call is refused.
+    test.eq(cp.status(db, "stuck").cursor, 7)
+    test.err(fn() cp.each_batch(db, "shape", fn(c, l) [1, 2], 1, fn(b, tx) null), "must return")
+    test.err(
+        fn() cp.each_batch(db, "dec", fn(c, l) ({ items: [1], next: 1.5m }), 1, fn(b, tx) null),
+        "JSON round trip",
+    )
+    test.err(fn() cp.each_batch(db, "lim", stuck, 0, fn(b, tx) null), "positive int")
+    test.err(fn() cp.each_batch(db, "", stuck, 1, fn(b, tx) null), "non-empty string")
+})
+
+test.case("a job name and a step name cannot collide", fn() {
+    db = sql.open(":memory:")
+    cp.step(db, "shared", fn() 1)
+    test.err(
+        fn() cp.each_batch(db, "shared", list_source([], cell(0)), 1, fn(b, tx) null),
+        "already used by a step",
+    )
+})
+
+# --- step --------------------------------------------------------------------
+
+test.case("step runs once and returns the stored value on the next run", fn() {
+    db = sql.open(":memory:")
+    calls = cell(0)
+    extract = fn() {
+        cell_update(calls, fn(n) n + 1)
+        { rows: 3, ids: [1, 2, 3], note: "ok" }
+    }
+    a = cp.step(db, "nightly/extract", extract)
+    b = cp.step(db, "nightly/extract", extract)
+    test.eq(a, { rows: 3, ids: [1, 2, 3], note: "ok" })
+    test.eq(b, a)
+    test.eq(cell_get(calls), 1)
+    st = cp.status(db, "nightly/extract")
+    test.eq(st.kind, "step")
+    test.eq(st.done, true)
+    test.eq(st.value, a)
+})
+
+test.case("a step that throws stores nothing and rolls back its writes", fn() {
+    db = sql.open(":memory:")
+    sql.exec(db, "create table totals (n integer)")
+    failing = fn() {
+        sql.exec(db, "insert into totals (n) values (1)")
+        error({ kind: "upstream", message: "provider timed out" })
+    }
+    test.err(fn() cp.step(db, "aggregate", failing), "provider timed out")
+    test.eq(cp.status(db, "aggregate"), null)
+    test.eq(row_count(db, "totals"), 0)
+
+    ok = fn() {
+        sql.exec(db, "insert into totals (n) values (1)")
+        "done"
+    }
+    test.eq(cp.step(db, "aggregate", ok), "done")
+    test.eq(cp.step(db, "aggregate", ok), "done")
+    test.eq(row_count(db, "totals"), 1)
+})
+
+test.case("a step result that JSON would change is refused, not stored", fn() {
+    db = sql.open(":memory:")
+    test.err(fn() cp.step(db, "money", fn() 19.99m), "JSON round trip")
+    test.eq(cp.status(db, "money"), null)
+    test.eq(cp.step(db, "money", fn() "19.99"), "19.99")
+})
+
+# --- status and reset --------------------------------------------------------
+
+test.case("status is null for an unknown name", fn() {
+    db = sql.open(":memory:")
+    test.eq(cp.status(db, "nope"), null)
+})
+
+test.case("reset forgets a job so it runs again from the start", fn() {
+    db = seeded(1..=5)
+    src = cp.sql_source(db, "gen1", "id")
+    cp.each_batch(db, "job", src, 2, copy_rows)
+    test.eq(cp.reset(db, "job"), true)
+    test.eq(cp.status(db, "job"), null)
+    test.eq(cp.reset(db, "job"), false)
+    sql.exec(db, "delete from gen2")
+    r = cp.each_batch(db, "job", src, 2, copy_rows)
+    test.eq(r.items, 5)
+    test.eq(row_count(db, "gen2"), 5)
+
+    calls = cell(0)
+    cp.step(db, "s", fn() cell_update(calls, fn(n) n + 1))
+    cp.reset(db, "s")
+    cp.step(db, "s", fn() cell_update(calls, fn(n) n + 1))
+    test.eq(cell_get(calls), 2)
+})
+
+# --- sql_source --------------------------------------------------------------
+
+test.case("sql_source pages by key through gaps and a short last batch", fn() {
+    db = seeded([1, 2, 5, 9, 10, 11, 20, 33, 34, 100, 101])
+    sql.exec(db, "create table batches (n integer, id integer)")
+    seq = cell(0)
+    r = cp.each_batch(db, "gaps", cp.sql_source(db, "gen1", "id"), 4, fn(batch, tx) {
+        n = cell_update(seq, fn(x) x + 1)
+        for row in batch {
+            sql.exec(tx, "insert into batches (n, id) values (?, ?)", [n, row.id])
+        }
+    })
+    test.eq(r.batches, 3)
+    test.eq(r.items, 11)
+    ids_of = fn(n) map(
+        sql.query(db, "select id from batches where n = ? order by id", [n]),
+        fn(row) row.id,
+    )
+    test.eq(ids_of(1), [1, 2, 5, 9])
+    test.eq(ids_of(2), [10, 11, 20, 33])
+    test.eq(ids_of(3), [34, 100, 101])
+})
+
+test.case("sql_source applies a where block and a column list", fn() {
+    db = seeded(1..=10)
+    src = cp.sql_source(db, "gen1", "id", where: sql { cents >= {500} }, columns: ["cents"])
+    page = src(null, 3)
+    test.eq(map(page.items, fn(r) r.id), [5, 6, 7])
+    test.eq(sort(keys(page.items[0])), ["cents", "id"])
+    test.eq(page.next, 7)
+    test.eq(map(src(7, 10).items, fn(r) r.id), [8, 9, 10])
+    test.eq(src(10, 10).items, [])
+})
+
+test.case("sql_source works on a unique text key", fn() {
+    db = sql.open(":memory:")
+    sql.exec(db, "create table accounts (ref text not null unique, n integer)")
+    for ref in ["b", "a", "d", "c"] {
+        sql.exec(db, "insert into accounts (ref, n) values (?, 1)", [ref])
+    }
+    seen = cell([])
+    cp.each_batch(db, "refs", cp.sql_source(db, "accounts", "ref"), 3, fn(batch, tx) {
+        cell_update(seen, fn(xs) xs + map(batch, fn(r) r.ref))
+    })
+    test.eq(cell_get(seen), ["a", "b", "c", "d"])
+})
+
+test.case("sql_source refuses a key that is not unique, and bad names", fn() {
+    db = sql.open(":memory:")
+    sql.exec(db, "create table t (id integer primary key, day text, code text)")
+    sql.exec(db, "create unique index t_code on t (code) where code is not null")
+    test.err(fn() cp.sql_source(db, "t", "day"), "not unique")
+    test.err(fn() cp.sql_source(db, "t", "code"), "not unique")
+    test.err(fn() cp.sql_source(db, "missing", "id"), "no table")
+    test.err(fn() cp.sql_source(db, "t", "nope"), "no column")
+    test.err(fn() cp.sql_source(db, "t; drop table t", "id"), "plain SQL identifier")
+    test.err(fn() cp.sql_source(db, "t", "id", where: "day = 'x'"), "sql")
+})

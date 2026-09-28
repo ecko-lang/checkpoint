@@ -1,0 +1,88 @@
+# A resumable backfill: copy transaction records from a gen1 table into a gen2
+# table in batches, survive a crash part-way through, and finish on the next
+# run with every record written exactly once.
+#
+#   ecko example.ecko
+#
+# Runs offline against an in-memory database, so the output is the same every
+# time. In production the only change is sql.open("ledger.db").
+import std.sql
+import "./main.ecko" as checkpoint
+
+db = sql.open(":memory:")
+sql.exec(
+    db,
+    "create table gen1_transactions (id integer primary key, account text not null, cents integer not null)",
+)
+sql.exec(
+    db,
+    "create table gen2_transactions (id integer primary key, account_ref text not null, amount_cents integer not null, migrated integer not null)",
+)
+
+# 47 records with gaps in the ids, the way a real table looks after deletes.
+for i in 1..=47 {
+    sql.exec(
+        db,
+        "insert into gen1_transactions (id, account, cents) values (?, ?, ?)",
+        [i * 3, "acct-{i % 5}", i * 125],
+    )
+}
+
+fn migrate(tx, row) {
+    sql.exec(
+        tx,
+        "insert into gen2_transactions (id, account_ref, amount_cents, migrated) values (?, ?, ?, 1)",
+        [row.id, upper(row.account), row.cents],
+    )
+}
+
+source = checkpoint.sql_source(db, "gen1_transactions", "id")
+
+# First run: the process "dies" while writing the third batch.
+fn crashing(batch, tx) {
+    for row in batch {
+        migrate(tx, row)
+    }
+    if batch[0].id > 60 { error({ kind: "killed", message: "OOM-killed mid-batch" }) }
+}
+
+try {
+    checkpoint.each_batch(db, "gen2-backfill", source, 10, crashing)
+} catch (e) {
+    print("run 1 stopped: " + get(e, "message"))
+}
+st = checkpoint.status(db, "gen2-backfill")
+written = sql.query_one(db, "select count(*) as n from gen2_transactions").n
+print("  committed batches: {st.batches}, cursor: {st.cursor}, rows in gen2: {written}")
+
+# Second run: same call, resumes after the last committed batch.
+r = checkpoint.each_batch(db, "gen2-backfill", source, 10, fn(batch, tx) {
+    for row in batch {
+        migrate(tx, row)
+    }
+})
+print("run 2 finished: {r.batches} batches, {r.items} rows, done: {r.done}")
+
+totals = sql.query_one(
+    db,
+    "select count(*) as n, count(distinct id) as ids, sum(amount_cents) as cents from gen2_transactions",
+)
+print("  gen2 rows: {totals.n}, distinct ids: {totals.ids}, total cents: {totals.cents}")
+
+# Third run: the job is done, so this returns at once.
+again = checkpoint.each_batch(db, "gen2-backfill", source, 10, crashing)
+print("run 3: {again.batches} batches (already done)")
+
+# A pipeline step runs once; the next run gets the stored result back.
+fn summarise() {
+    rows = sql.query(
+        db,
+        "select account_ref, count(*) as n from gen2_transactions group by account_ref order by account_ref",
+    )
+    map(rows, fn(row) "{row.account_ref}={row.n}")
+}
+print("summary: " + join(checkpoint.step(db, "gen2-backfill/summary", summarise), ", "))
+print(
+    "summary again: " +
+        join(checkpoint.step(db, "gen2-backfill/summary", fn() error("not called")), ", "),
+)
