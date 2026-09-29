@@ -85,6 +85,7 @@ through `db` commit only if the step is recorded.
 | `status(db, name)` | the stored state of a job or step, or `null` |
 | `reset(db, name)` | forget a job or step so it runs again from the start; returns whether it existed |
 | `sql_source(db, table, key, where = null, columns = null)` | a keyset-paginated source over a table, for `each_batch` |
+| `jsonl_source(stream)` | a source over a JSON-lines file stream that resumes by byte offset, for `each_batch` |
 
 ### Sources
 
@@ -96,7 +97,7 @@ JSON, so it must be an int, string, list or map of those.
 | source | cursor |
 |---|---|
 | a SQL table, via `sql_source` | the last key read |
-| a JSONL file | a byte or line offset |
+| a JSONL file, via `jsonl_source` | the byte offset after the last line read |
 | a paginated HTTP API | the page token |
 
 A run ends when the source returns no items, or returns items with
@@ -135,6 +136,32 @@ It is built to be hard to misuse:
 - `where` must be a `sql { ... }` block, so its values bind as parameters.
 - `columns` always gets the key added if you left it out.
 - Rows whose key is `NULL` are never visited.
+
+### `jsonl_source`
+
+```ecko
+import std.fs
+
+events = checkpoint.jsonl_source(fs.open("events.jsonl"))
+checkpoint.each_batch(db, "events-backfill", events, 10000, fn(batch, tx) {
+    for e in batch {
+        sql.exec(tx, "insert into events (id, kind) values (?, ?)", [e.id, e.kind])
+    }
+})
+```
+
+Each batch is the next `limit` lines, decoded. The cursor is the byte offset just
+past the batch's last line, so a job that stopped at line 800,000,000 resumes
+there with `io.seek` - it does not read the first 800,000,000 lines again. A
+restarted process opens a fresh stream and `each_batch` hands the source the
+stored cursor.
+
+- **You open the file.** Passing a stream keeps the file access yours, so this
+  package still needs no capabilities.
+- Blank lines are skipped. A line that is not JSON stops the batch with a
+  `parse` error carrying `offset`, the byte where that line starts.
+- It needs a file stream, because only a file can seek, and an Ecko with `io.seek`
+  (the first release after 0.56).
 
 ### `status`
 

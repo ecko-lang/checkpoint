@@ -8,6 +8,7 @@
 import std.test
 import std.sql
 import std.fs
+import std.io
 import "../main.ecko" as cp
 
 # A source table `gen1` holding the given ids, each with cents = id * 100.
@@ -317,4 +318,49 @@ test.case("sql_source refuses a key that is not unique, and bad names", fn() {
     test.err(fn() cp.sql_source(db, "t", "nope"), "no column")
     test.err(fn() cp.sql_source(db, "t; drop table t", "id"), "plain SQL identifier")
     test.err(fn() cp.sql_source(db, "t", "id", where: "day = 'x'"), "sql")
+})
+
+# A JSONL file with ids 1..n, one object per line.
+fn jsonl_file(n) {
+    p = fs.temp_file(".jsonl")
+    mut text = ""
+    for i in 1..=n {
+        text = text + "\{\"id\": {i}, \"cents\": {i * 100}}\n"
+    }
+    fs.write(p, text)
+    p
+}
+
+test.case("jsonl_source resumes a crashed job at the byte after the last batch", fn() {
+    p = jsonl_file(25)
+    db = sql.open(":memory:")
+    sql.exec(db, "create table gen2 (id integer, cents integer)")
+    s = fs.open(p)
+    crash_on_third = fn(batch, tx) {
+        copy_rows(batch, tx)
+        if batch[0].id == 21 { error({ kind: "crash", message: "killed mid-batch" }) }
+    }
+    test.err(
+        fn() cp.each_batch(db, "jsonl", cp.jsonl_source(s), 10, crash_on_third),
+        "killed mid-batch",
+    )
+    test.eq(row_count(db, "gen2"), 20)
+    # A fresh stream, as a restarted process would open, resumes at line 21.
+    r = cp.each_batch(db, "jsonl", cp.jsonl_source(fs.open(p)), 10, copy_rows)
+    test.eq(r.items, 5)
+    test.eq(row_count(db, "gen2"), 25)
+    test.eq(distinct_ids(db), 25)
+    fs.remove(p)
+})
+
+test.case("jsonl_source skips blank lines and names a line that is not JSON", fn() {
+    p = fs.temp_file(".jsonl")
+    fs.write(p, "\{\"id\": 1}\n\n\{\"id\": 2}\nnot json\n")
+    db = sql.open(":memory:")
+    seen = cell([])
+    test.err(fn() cp.each_batch(db, "bad", cp.jsonl_source(fs.open(p)), 10, fn(batch, tx) {
+        cell_update(seen, fn(xs) xs + map(batch, fn(r) r.id))
+    }), "not JSON")
+    test.eq(cell_get(seen), [])
+    fs.remove(p)
 })

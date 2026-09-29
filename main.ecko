@@ -28,6 +28,7 @@
 
 import std.sql
 import std.json
+import std.io
 import std.time
 import std.re
 
@@ -342,5 +343,47 @@ export fn sql_source(db, table, key, where = null, columns = null) {
         }
         next = if len(rows) == 0 { cursor } else { get(last(rows), key) }
         { items: rows, next: next }
+    }
+}
+
+## jsonl_source(stream) -> source function. A source over a JSON-lines stream
+## for `each_batch`: each batch is the next `limit` lines, decoded, and the
+## cursor is the byte offset just past the batch's last line, so a job that
+## stops resumes at the next line with `io.seek` instead of reading every line
+## again. Open the stream yourself - `fs.open("events.jsonl")` - so the file
+## access is yours and this package stays free of capabilities; a restarted run
+## opens a fresh stream and resumes from the stored cursor. Blank lines are
+## skipped. A line that is not JSON stops the batch with a `parse` error that
+## names the byte offset where the line starts. Only a file stream can seek.
+export fn jsonl_source(stream) {
+    unless type_of(stream) == "stream" {
+        error("checkpoint.jsonl_source: expected a stream from fs.open, got {type_of(stream)}")
+    }
+    fn(cursor, limit) {
+        io.seek(stream, if cursor == null { 0 } else { cursor })
+        mut items = []
+        mut at = io.tell(stream)
+        mut line = io.read_line(stream)
+        while line != null {
+            if trim(line) != "" {
+                item = try {
+                    json.decode(line)
+                } catch (e) {
+                    error(
+                        {
+                            kind: "parse",
+                            format: "json",
+                            offset: at,
+                            message: "checkpoint.jsonl_source: the line at byte {at} is not JSON ({e.message})",
+                        },
+                    )
+                }
+                items = push(items, item)
+                if len(items) >= limit { break }
+            }
+            at = io.tell(stream)
+            line = io.read_line(stream)
+        }
+        { items: items, next: if len(items) == 0 { null } else { io.tell(stream) } }
     }
 }
