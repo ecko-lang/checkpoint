@@ -161,7 +161,7 @@ stored cursor.
 - Blank lines are skipped. A line that is not JSON stops the batch with a
   `parse` error carrying `offset`, the byte where that line starts.
 - It needs a file stream, because only a file can seek, and an Ecko with `io.seek`
-  (the first release after 0.56).
+  (0.57 or later).
 
 ### `status`
 
